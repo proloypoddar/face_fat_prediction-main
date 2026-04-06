@@ -13,10 +13,9 @@ __pycache__/
 .idea/
 
 # Results and Outputs
-*_result*.jpg
+
 *_result*.csv
-*_v3.jpg
-*_jmt.jpg
+
 
 # Previous versions (optional, but requested for 06.py only)
 01.py
