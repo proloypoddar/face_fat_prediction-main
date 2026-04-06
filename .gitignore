@@ -1,0 +1,37 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Results and Outputs
+*_result*.jpg
+*_result*.csv
+*_v3.jpg
+*_jmt.jpg
+
+# Previous versions (optional, but requested for 06.py only)
+01.py
+02.py
+03.py
+04.py
+05.py
+fix.py
+last update.py
+
+# Large Sample Images
+style1_00014.png
+WIN_*.jpg
+WhatsApp*.jpeg
+WhatsApp*.jpg
+*.png
+*.jpg
+*.jpeg
