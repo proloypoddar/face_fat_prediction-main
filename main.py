@@ -30,6 +30,37 @@ except ImportError:
 # ── MiDaS (optional) ─────────────────────────────────────────────────────────
 MIDAS_OK = False
 midas_model = midas_transform = None
+NO_GUI = os.environ.get("NO_GUI", "0") == "1"
+
+def _get_cli_or_env_defaults():
+    """
+    Returns a dict with optional defaults from env/CLI:
+    { 'image_path': str|None, 'age': int|None, 'mode': str|None,
+      'autoselect_all': bool }
+    CLI positional fallback: main.py [image_path] [age] [mode]
+    Env vars: IMAGE_PATH, AGE, MODE, AUTOSELECT_ALL=1
+    """
+    image_path = os.environ.get("IMAGE_PATH")
+    age = os.environ.get("AGE")
+    mode = os.environ.get("MODE")
+    autoselect = os.environ.get("AUTOSELECT_ALL", "0") == "1"
+    # CLI positional overrides env if present
+    if len(sys.argv) >= 2 and sys.argv[1] and sys.argv[1] != "-u":
+        image_path = sys.argv[1]
+    if len(sys.argv) >= 3:
+        age = sys.argv[2]
+    if len(sys.argv) >= 4:
+        mode = sys.argv[3]
+    try:
+        age_val = int(age) if age is not None else None
+    except ValueError:
+        age_val = None
+    return {
+        "image_path": image_path,
+        "age": age_val,
+        "mode": mode,
+        "autoselect_all": autoselect,
+    }
 
 def _try_load_midas():
     global MIDAS_OK, midas_model, midas_transform
@@ -51,12 +82,22 @@ def _try_load_midas():
         print(f"[WARN] MiDaS unavailable ({e})")
 
 try:
-    mp_solutions = mp.solutions
-except AttributeError:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
+    MP_NEW_API = True
+except Exception:
+    # Fallback to old API
     try:
         import mediapipe.python.solutions as mp_solutions
+        import mediapipe as mp
+        MP_NEW_API = False
     except Exception:
-        raise ImportError("pip install mediapipe")
+        raise ImportError(
+            f"MediaPipe not available in this Python ({sys.executable}).\n"
+            f"Install it for THIS interpreter:\n  {sys.executable} -m pip install mediapipe\n"
+            "If you use 'python', ensure it points to the same interpreter."
+        )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LANDMARK DEFINITIONS
@@ -313,54 +354,55 @@ def fuse_signals(mp_s,lum_s,midas_s,yaw_conf,lum_ok=True,midas_ok=True):
 # ═══════════════════════════════════════════════════════════════════════════════
 # MICRO-CNN  (SIGNAL 4 – AI Compare)
 # ═══════════════════════════════════════════════════════════════════════════════
-class MicroHollowCNN(nn.Module):
-    """
-    Lightweight patch CNN – no external weights needed.
-    Input: 32×32 RGB patch (normalised).
-    Output: scalar 0-1 (hollow probability).
-
-    Architecture: 3 conv blocks → global-avg-pool → 2-layer head.
-    Feature extraction is heuristically guided via weight init rather than
-    supervised training (zero-shot geometric priors).
-    """
-    def __init__(self):
-        super().__init__()
-        self.enc = nn.Sequential(
-            nn.Conv2d(3,16,3,padding=1), nn.BatchNorm2d(16), nn.ReLU(),
-            nn.MaxPool2d(2),                                             # 16×16
-            nn.Conv2d(16,32,3,padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d(2),                                             # 8×8
-            nn.Conv2d(32,64,3,padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),                                     # 1×1
-        )
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64,32), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(32,1), nn.Sigmoid(),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
+if TORCH_OK:
+    class MicroHollowCNN(nn.Module):
         """
-        Heuristic init: first conv sensitive to dark-centre / shadow patterns
-        (shadow = hollow cue).  No labelled data needed.
-        """
-        with torch.no_grad():
-            # centre-dark detector kernel
-            k = torch.zeros(3,3)
-            k[1,1]=-1.5; k[0,0]=k[0,2]=k[2,0]=k[2,2]=0.3; k[0,1]=k[1,0]=k[1,2]=k[2,1]=0.15
-            for c in range(3):
-                self.enc[0].weight.data[0,c] = k
-            # edge/gradient detector
-            edge = torch.tensor([[-1,-1,-1],[-1,8,-1],[-1,-1,-1]],dtype=torch.float32)/8.0
-            for c in range(3):
-                self.enc[0].weight.data[1,c] = edge
-            # horizontal shadow band
-            hband = torch.zeros(3,3); hband[1,:]=1.0; hband[0,:]=hband[2,:]=-0.5
-            for c in range(3):
-                self.enc[0].weight.data[2,c] = hband
+        Lightweight patch CNN – no external weights needed.
+        Input: 32×32 RGB patch (normalised).
+        Output: scalar 0-1 (hollow probability).
 
-    def forward(self,x): return self.head(self.enc(x))
+        Architecture: 3 conv blocks → global-avg-pool → 2-layer head.
+        Feature extraction is heuristically guided via weight init rather than
+        supervised training (zero-shot geometric priors).
+        """
+        def __init__(self):
+            super().__init__()
+            self.enc = nn.Sequential(
+                nn.Conv2d(3,16,3,padding=1), nn.BatchNorm2d(16), nn.ReLU(),
+                nn.MaxPool2d(2),                                             # 16×16
+                nn.Conv2d(16,32,3,padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+                nn.MaxPool2d(2),                                             # 8×8
+                nn.Conv2d(32,64,3,padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1),                                     # 1×1
+            )
+            self.head = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(64,32), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(32,1), nn.Sigmoid(),
+            )
+            self._init_weights()
+
+        def _init_weights(self):
+            """
+            Heuristic init: first conv sensitive to dark-centre / shadow patterns
+            (shadow = hollow cue).  No labelled data needed.
+            """
+            with torch.no_grad():
+                # centre-dark detector kernel
+                k = torch.zeros(3,3)
+                k[1,1]=-1.5; k[0,0]=k[0,2]=k[2,0]=k[2,2]=0.3; k[0,1]=k[1,0]=k[1,2]=k[2,1]=0.15
+                for c in range(3):
+                    self.enc[0].weight.data[0,c] = k
+                # edge/gradient detector
+                edge = torch.tensor([[-1,-1,-1],[-1,8,-1],[-1,-1,-1]],dtype=torch.float32)/8.0
+                for c in range(3):
+                    self.enc[0].weight.data[1,c] = edge
+                # horizontal shadow band
+                hband = torch.zeros(3,3); hband[1,:]=1.0; hband[0,:]=hband[2,:]=-0.5
+                for c in range(3):
+                    self.enc[0].weight.data[2,c] = hband
+
+        def forward(self,x): return self.head(self.enc(x))
 
 
 _cnn_model = None
@@ -394,27 +436,52 @@ def _extract_patch(frame_bgr, landmarks, indices, h, w):
     patch=cv2.resize(patch,(PATCH_SIZE,PATCH_SIZE))
     return patch
 
+
+def _heuristic_patch_score(patch):
+    """Fallback hollow score when torch is unavailable."""
+    if patch is None or patch.size == 0: return 0.0
+    lab=cv2.cvtColor(patch,cv2.COLOR_BGR2LAB).astype(np.float32)
+    L=lab[:,:,0]
+    h,w=L.shape
+    if h < 8 or w < 8: return 0.0
+    margin=max(1,min(h,w)//4)
+    inner=L[margin:h-margin, margin:w-margin] if margin < min(h,w)//2 else L
+    border_mask=np.ones_like(L, dtype=np.uint8)
+    if margin < min(h,w)//2:
+        border_mask[margin:-margin, margin:-margin] = 0
+    border=L[border_mask==1]
+    if len(inner)==0 or len(border)==0: return 0.0
+    center_dark=max(float(np.mean(border)-np.mean(inner)),0.0)
+    contrast=center_dark/(np.mean(border)+1e-6)
+    std_dev=np.std(L)
+    edge_strength=np.mean(np.abs(cv2.Laplacian(L,cv2.CV_32F)))
+    edge_score=np.clip(edge_strength/18.0,0,1)
+    score=0.55*contrast + 0.25*(1.0-np.clip(std_dev/35.0,0,1)) + 0.20*(1.0-edge_score)
+    return round(float(np.clip(score,0,1)),2)
+
+
 def get_cnn_hollow_scores(frame_bgr, landmarks, h, w):
     """
     Returns {region: cnn_hollow_score 0-1}
     Uses micro-CNN on each region patch.
-    Falls back to zeros if torch unavailable.
+    Falls back to a simple shadow heuristic if torch unavailable.
     """
     model=_get_cnn()
-    if model is None: return {r:0.0 for r in REGIONS}
-
     scores={}
     for region,indices in REGIONS.items():
         patch=_extract_patch(frame_bgr,landmarks,indices,h,w)
-        if patch is None: scores[region]=0.0; continue
-        # BGR→RGB, normalise, tensor
-        rgb=cv2.cvtColor(patch,cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
-        t=torch.from_numpy(rgb.transpose(2,0,1)).unsqueeze(0)
-        with torch.no_grad():
-            val=float(model(t).item())
-        # scale – CNN raw output is 0-1 but typically biased low; stretch
-        val=float(np.clip(val*1.4,0,1))
-        scores[region]=round(val,2)
+        if patch is None:
+            scores[region]=0.0
+            continue
+        if model is not None:
+            rgb=cv2.cvtColor(patch,cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+            t=torch.from_numpy(rgb.transpose(2,0,1)).unsqueeze(0)
+            with torch.no_grad():
+                val=float(model(t).item())
+            val=float(np.clip(val*1.4,0,1))
+            scores[region]=round(val,2)
+        else:
+            scores[region]=_heuristic_patch_score(patch)
     return scores
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,16 +539,22 @@ FACE_SHAPE_TIPS = {
 
 def detect_face_shape(landmarks, h, w):
     """
-    Classify face shape using 6 key ratios derived from MediaPipe landmarks.
+    Classify face shape using 8+ key ratios and weighted scoring for higher accuracy.
     Returns (shape_name, metrics_dict).
     """
     def pt(idx): return np.array([landmarks[idx].x*w, landmarks[idx].y*h])
 
+    # Extended set of measurements
     face_w   = np.linalg.norm(pt(FACE_LEFT) -pt(FACE_RIGHT))
     face_h   = np.linalg.norm(pt(FACE_TOP)  -pt(FACE_BOTTOM))
     jaw_w    = np.linalg.norm(pt(JAW_LEFT)  -pt(JAW_RIGHT))
     fore_w   = np.linalg.norm(pt(FOREHEAD_LEFT)-pt(FOREHEAD_RIGHT))
     cheek_w  = np.linalg.norm(pt(CHEEK_LEFT)-pt(CHEEK_RIGHT))
+    temple_w = np.linalg.norm(pt(TEMPLE_L) -pt(TEMPLE_R))
+    
+    # Vertical measurements
+    upper_h  = np.linalg.norm(pt(FACE_TOP)  -pt(FOREHEAD_LEFT))  # forehead height
+    mid_h    = np.linalg.norm(pt(FOREHEAD_LEFT)-pt(152))  # mid-face to chin
 
     # Jaw angle sharpness: angle at jaw corner
     def jaw_angle(lm_corner, lm_chin, lm_jaw):
@@ -491,38 +564,66 @@ def detect_face_shape(landmarks, h, w):
         return float(np.degrees(np.arccos(np.clip(cos_a,-1,1))))
 
     jaw_ang = (jaw_angle(JAW_ANGLE_L,152,172)+jaw_angle(JAW_ANGLE_R,152,397))/2
+    
+    # Chin prominence: distance from jaw line to chin tip
+    chin_y = pt(152)[1]
+    jaw_l_y = pt(JAW_LEFT)[1]
+    jaw_r_y = pt(JAW_RIGHT)[1]
+    chin_promi = max(0, (jaw_l_y + jaw_r_y)/2 - chin_y)  # positive = prominent chin
 
     eps = 1e-4
     ratio_hw  = face_h  / (face_w  + eps)   # >1.2 = long
     ratio_jf  = jaw_w   / (fore_w  + eps)   # >0.9 = square/round, <0.7 = heart
     ratio_cf  = cheek_w / (fore_w  + eps)   # >1.05 = diamond
     ratio_cj  = cheek_w / (jaw_w   + eps)   # cheek vs jaw
+    ratio_tf  = temple_w / (fore_w + eps)   # temple to forehead
+    ratio_um  = upper_h / (mid_h + eps)     # upper to mid face
 
     metrics = {
         "face_h/w":  round(ratio_hw,2),
         "jaw/fore":  round(ratio_jf,2),
         "cheek/fore":round(ratio_cf,2),
         "cheek/jaw": round(ratio_cj,2),
+        "temple/fore":round(ratio_tf,2),
+        "upper/mid": round(ratio_um,2),
         "jaw_angle": round(jaw_ang,1),
+        "chin_promi": round(chin_promi,1),
         "face_w":    round(face_w,1),
         "face_h":    round(face_h,1),
     }
 
-    # Decision tree (clinically inspired)
-    if ratio_hw > 1.35:
-        shape = "Oblong"
-    elif ratio_cf > 1.08 and ratio_jf < 0.80:
-        shape = "Diamond"
-    elif ratio_jf < 0.72:
-        shape = "Heart"
-    elif ratio_hw < 1.10 and ratio_jf > 0.88:
-        shape = "Round"
-    elif jaw_ang < 125 and ratio_jf > 0.85:
-        shape = "Square"
-    else:
-        shape = "Oval"
-
-    return shape, metrics
+    # Weighted scoring for more robust classification
+    scores = {"oblong":0, "diamond":0, "heart":0, "round":0, "square":0, "oval":0}
+    
+    # Oblong: tall + narrow
+    if ratio_hw > 1.25: scores["oblong"] += 3
+    if ratio_cf < 0.95: scores["oblong"] += 1
+    
+    # Diamond: high cheeks, narrow forehead & jaw
+    if ratio_cf > 1.05: scores["diamond"] += 3
+    if ratio_tf > 0.95: scores["diamond"] += 2
+    if ratio_jf < 0.78: scores["diamond"] += 2
+    
+    # Heart: wide forehead, narrow jaw
+    if ratio_jf < 0.70: scores["heart"] += 3
+    if ratio_cf > 1.0: scores["heart"] += 1
+    if chin_promi > 5: scores["heart"] += 2
+    
+    # Round: compact, similar widths
+    if ratio_hw < 1.15: scores["round"] += 2
+    if 0.85 < ratio_jf < 0.95: scores["round"] += 3
+    if abs(ratio_cf - 1.0) < 0.1: scores["round"] += 2
+    
+    # Square: strong jaw, angular
+    if 0.92 < ratio_jf < 1.05: scores["square"] += 3
+    if jaw_ang < 130: scores["square"] += 3
+    if ratio_cf < 1.0: scores["square"] += 1
+    
+    # Oval: balanced (default fallback)
+    scores["oval"] = 1  # base score
+    
+    shape = max(scores, key=scores.get)
+    return shape.capitalize(), metrics
 
 def draw_face_shape_overlay(frame, landmarks, shape, metrics, h, w):
     """Draw face outline + shape annotation."""
@@ -754,11 +855,12 @@ def run_ai_compare(age, image_path, landmarks, frame_bgr, h, w,
 # DRAW ORIGINAL OVERLAY  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 def draw_overlay(frame, landmarks, fat_data, h, w, face_mesh_module):
-    for conn in face_mesh_module.FACEMESH_CONTOURS:
-        a,b=conn
-        if a<len(landmarks) and b<len(landmarks):
-            cv2.line(frame,(int(landmarks[a].x*w),int(landmarks[a].y*h)),
-                           (int(landmarks[b].x*w),int(landmarks[b].y*h)),(70,70,70),1)
+    if face_mesh_module:
+        for conn in face_mesh_module.FACEMESH_CONTOURS:
+            a,b=conn
+            if a<len(landmarks) and b<len(landmarks):
+                cv2.line(frame,(int(landmarks[a].x*w),int(landmarks[a].y*h)),
+                               (int(landmarks[b].x*w),int(landmarks[b].y*h)),(70,70,70),1)
     overlay=frame.copy()
     deep_idx_set=set()
     for rn in NATURALLY_DEEP: deep_idx_set.update(REGIONS.get(rn,[]))
@@ -827,11 +929,12 @@ def draw_overlay(frame, landmarks, fat_data, h, w, face_mesh_module):
 # ═══════════════════════════════════════════════════════════════════════════════
 def draw_ai_overlay(frame, landmarks, ai_fat_data, h, w, face_mesh_module):
     """Same layout as draw_overlay but uses CNN-fused scores; teal palette."""
-    for conn in face_mesh_module.FACEMESH_CONTOURS:
-        a,b=conn
-        if a<len(landmarks) and b<len(landmarks):
-            cv2.line(frame,(int(landmarks[a].x*w),int(landmarks[a].y*h)),
-                           (int(landmarks[b].x*w),int(landmarks[b].y*h)),(50,80,80),1)
+    if face_mesh_module:
+        for conn in face_mesh_module.FACEMESH_CONTOURS:
+            a,b=conn
+            if a<len(landmarks) and b<len(landmarks):
+                cv2.line(frame,(int(landmarks[a].x*w),int(landmarks[a].y*h)),
+                               (int(landmarks[b].x*w),int(landmarks[b].y*h)),(50,80,80),1)
     overlay=frame.copy()
     for region,indices in REGIONS.items():
         v=ai_fat_data["regions"][region]; mf=v["mf"]; hollow=v["hollow"]; severity=v["severity"]
@@ -876,7 +979,7 @@ def build_diff_panel(diff_table, ai_fat_data, face_shape, shape_metrics, cam_h):
     cv2.line(panel,(0,0),(0,cam_h),(50,200,200),2)
 
     y=22
-    cv2.putText(panel,"AI COMPARE – Hollow Diff",(8,y),cv2.FONT_HERSHEY_PLAIN,1.05,(50,200,200),1); y+=16
+    cv2.putText(panel,"AI COMPARE - Hollow Diff",(8,y),cv2.FONT_HERSHEY_PLAIN,1.05,(50,200,200),1); y+=16
 
     # Face shape summary
     if face_shape:
@@ -942,8 +1045,8 @@ def build_diff_panel(diff_table, ai_fat_data, face_shape, shape_metrics, cam_h):
         cv2.rectangle(panel,(8,y),(PW-12,y+8),(60,60,60),1)
         y+=14
         # CNN availability
-        cnn_txt="CNN: ACTIVE (micro-CNN)" if TORCH_OK else "CNN: DISABLED (no torch)"
-        cnn_col=(0,220,120) if TORCH_OK else (60,60,255)
+        cnn_txt="CNN: ACTIVE (micro-CNN)" if TORCH_OK else "CNN: HEURISTIC (no torch)"
+        cnn_col=(0,220,120) if TORCH_OK else (160,160,60)
         cv2.putText(panel,cnn_txt,(8,y+4),cv2.FONT_HERSHEY_PLAIN,0.72,cnn_col,1)
 
     cv2.putText(panel,"PLANNING AID ONLY – clinician review required",
@@ -1074,7 +1177,7 @@ def print_ai_compare(diff_table, ai_fat_data, face_shape, shape_metrics, image_p
     print(f"\n{BOLD}{'─'*78}{RESET}")
     print(f"{BOLD}  AI COMPARE  |  {os.path.basename(image_path)}  |  Age: {age}{RESET}")
     print(f"{'─'*78}")
-    cnn_st="ACTIVE (micro-CNN+heuristic init)" if TORCH_OK else "DISABLED (install torch)"
+    cnn_st="ACTIVE (micro-CNN+heuristic init)" if TORCH_OK else "HEURISTIC (no torch)"
     print(f"  CNN Status : {cnn_st}")
     if face_shape:
         tips=FACE_SHAPE_TIPS.get(face_shape,{})
@@ -1207,19 +1310,34 @@ def main():
     if TORCH_OK: _try_load_midas()
     else: print("[WARN] Torch unavailable – MiDaS and CNN disabled.")
 
+    defaults = _get_cli_or_env_defaults()
+    headless = NO_GUI or bool(defaults["image_path"])  # treat CLI path as non-interactive run
+
     # Image
-    while True:
-        image_path=input("\nEnter path to face image (JPG/PNG): ").strip().strip('"').strip("'")
-        if os.path.isfile(image_path): break
-        print(f"  [!] File not found: '{image_path}'")
+    image_path = defaults["image_path"]
+    if image_path and os.path.isfile(image_path):
+        print(f"\n[INFO] Using image: {image_path}")
+    else:
+        while True:
+            image_path=input("\nEnter path to face image (JPG/PNG): ").strip().strip('"').strip("'")
+            if os.path.isfile(image_path): break
+            print(f"  [!] File not found: '{image_path}'")
 
     # Age
-    while True:
-        try:
-            age=int(input("Enter patient age: ").strip())
-            if 1<=age<=120: break
-            print("  [!] Age 1–120.")
-        except ValueError: print("  [!] Enter a valid number.")
+    age = defaults["age"]
+    if age is None:
+        while True:
+            try:
+                age=int(input("Enter patient age: ").strip())
+                if 1<=age<=120: break
+                print("  [!] Age 1–120.")
+            except ValueError: print("  [!] Enter a valid number.")
+    else:
+        if not (1<=age<=120):
+            print(f"[WARN] AGE out of range; defaulting to 30 (was {age})")
+            age=30
+        else:
+            print(f"[INFO] Using age: {age}")
 
     # Mode
     print(f"\n{'─'*62}")
@@ -1229,17 +1347,29 @@ def main():
     print("  [3] Both")
     print("  [4] AI Compare  (CNN hollow analysis + face shape + diff)")
     print("  [5] All of the above")
-    while True:
-        m=input("  Mode [1-5]: ").strip()
-        if m in ("","1"): run_anat=True;  run_jmt=False; run_ai=False; break
-        elif m=="2":       run_anat=False; run_jmt=True;  run_ai=False; break
-        elif m=="3":       run_anat=True;  run_jmt=True;  run_ai=False; break
-        elif m=="4":       run_anat=False; run_jmt=False; run_ai=True;  break
-        elif m=="5":       run_anat=True;  run_jmt=True;  run_ai=True;  break
-        else: print("  [!] Enter 1–5.")
+    m = (defaults["mode"] or "").strip()
+    if m in ("1","2","3","4","5"):
+        print(f"[INFO] Using mode: {m}")
+    else:
+        while True:
+            m=input("  Mode [1-5]: ").strip()
+            if m in ("","1","2","3","4","5"): break
+            print("  [!] Enter 1–5.")
+    if m in ("","1"): run_anat=True;  run_jmt=False; run_ai=False
+    elif m=="2":         run_anat=False; run_jmt=True;  run_ai=False
+    elif m=="3":         run_anat=True;  run_jmt=True;  run_ai=False
+    elif m=="4":         run_anat=False; run_jmt=False; run_ai=True
+    else:                 run_anat=True;  run_jmt=True;  run_ai=True
 
-    selected_anat=select_anatomic_regions() if run_anat else None
-    selected_jmt=select_jmt_regions()       if run_jmt  else None
+    autoselect = defaults["autoselect_all"] or headless
+    if run_anat:
+        selected_anat = {r["key"] for r in ANATOMIC_SELECTABLE} if autoselect else select_anatomic_regions()
+    else:
+        selected_anat=None
+    if run_jmt:
+        selected_jmt = {r["key"] for r in JMT_REGIONS} if autoselect else select_jmt_regions()
+    else:
+        selected_jmt=None
 
     # Load & resize
     frame=cv2.imread(image_path)
@@ -1252,14 +1382,41 @@ def main():
 
     # MediaPipe
     print("[INFO] Detecting landmarks...")
-    mp_face_mesh=mp_solutions.face_mesh
-    with mp_face_mesh.FaceMesh(static_image_mode=True,max_num_faces=1,
-                                refine_landmarks=True,min_detection_confidence=0.5) as fm:
-        results=fm.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
-    if not results.multi_face_landmarks:
-        sys.exit("[ERROR] No face detected. Use a frontal, well-lit photo.")
-    landmarks=results.multi_face_landmarks[0].landmark
+    if MP_NEW_API:
+        import urllib.request
+        model_path = os.path.join("models", "face_landmarker.task")
+        if not os.path.exists(model_path):
+            os.makedirs("models", exist_ok=True)
+            print("[INFO] Downloading face landmarker model...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+            urllib.request.urlretrieve(url, model_path)
+            print("[INFO] Model downloaded.")
+        base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
+        options = mp_vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1, min_face_detection_confidence=0.5, min_face_presence_confidence=0.5, min_tracking_confidence=0.5, output_face_blendshapes=False, output_facial_transformation_matrixes=False)
+        with mp_vision.FaceLandmarker.create_from_options(options) as landmarker:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            result = landmarker.detect(mp_image)
+        if not result.face_landmarks:
+            sys.exit("[ERROR] No face detected. Use a frontal, well-lit photo.")
+        # Convert to old format for compatibility
+        landmarks = []
+        for lm in result.face_landmarks[0]:
+            landmarks.append(type('Landmark', (), {'x': lm.x, 'y': lm.y, 'z': lm.z})())
+    else:
+        mp_face_mesh=mp_solutions.face_mesh
+        with mp_face_mesh.FaceMesh(static_image_mode=True,max_num_faces=1,
+                                    refine_landmarks=True,min_detection_confidence=0.5) as fm:
+            results=fm.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+        if not results.multi_face_landmarks:
+            sys.exit("[ERROR] No face detected. Use a frontal, well-lit photo.")
+        landmarks=results.multi_face_landmarks[0].landmark
     print(f"[INFO] {len(landmarks)} landmarks detected.")
+
+    # Set face_mesh_module for drawing
+    if MP_NEW_API:
+        face_mesh_module = None  # FACEMESH_CONTOURS not directly available in new API
+    else:
+        face_mesh_module = mp_solutions.face_mesh
 
     # Compute base signals
     fat_data=calc_fat_volumes(age,landmarks,frame,h,w)
@@ -1271,7 +1428,7 @@ def main():
 
     # Annotated base image
     annotated=frame.copy()
-    draw_overlay(annotated,landmarks,fat_data,h,w,mp_face_mesh)
+    draw_overlay(annotated,landmarks,fat_data,h,w,face_mesh_module)
 
     base,_=os.path.splitext(image_path)
 
@@ -1284,7 +1441,8 @@ def main():
         p=f"{base}_result_v4.jpg"; cv2.imwrite(p,out,[cv2.IMWRITE_JPEG_QUALITY,95])
         print(f"[DONE] Anatomic image → {p}")
         export_csv(anat_data,age,image_path,mode="anatomic")
-        cv2.imshow("Fat Graft Predictor v4 – Anatomic",out)
+        if not NO_GUI:
+            cv2.imshow("Fat Graft Predictor v4 – Anatomic",out)
 
     # ── JMT ─────────────────────────────────────────────────────────────────
     if run_jmt:
@@ -1295,7 +1453,8 @@ def main():
         pj=f"{base}_result_v4_jmt.jpg"; cv2.imwrite(pj,outj,[cv2.IMWRITE_JPEG_QUALITY,95])
         print(f"[DONE] JMT image → {pj}")
         export_csv(jmt_data,age,image_path,mode="jmt")
-        cv2.imshow("Fat Graft Predictor v4 – JMT",outj)
+        if not NO_GUI:
+            cv2.imshow("Fat Graft Predictor v4 – JMT",outj)
 
     # ── AI COMPARE ──────────────────────────────────────────────────────────
     if run_ai:
@@ -1307,7 +1466,7 @@ def main():
 
         # Left: AI-annotated face  |  Right: diff panel
         ai_frame=frame.copy()
-        draw_ai_overlay(ai_frame,landmarks,ai_fat_data,h,w,mp_face_mesh)
+        draw_ai_overlay(ai_frame,landmarks,ai_fat_data,h,w,face_mesh_module)
         diff_panel=build_diff_panel(diff_table,ai_fat_data,face_shape,shape_metrics,h)
         out_ai=np.hstack([ai_frame,diff_panel])
 
@@ -1322,19 +1481,22 @@ def main():
             pc=f"{base}_result_v4_compare.jpg"
             cv2.imwrite(pc,compare_full,[cv2.IMWRITE_JPEG_QUALITY,95])
             print(f"[DONE] Side-by-side compare → {pc}")
-            cv2.imshow("Fat Graft Predictor v4 – Side-by-Side",compare_full)
+            if not NO_GUI:
+                cv2.imshow("Fat Graft Predictor v4 – Side-by-Side",compare_full)
 
         pd=f"{base}_result_v4_ai.jpg"
         cv2.imwrite(pd,out_ai,[cv2.IMWRITE_JPEG_QUALITY,95])
         print(f"[DONE] AI panel image → {pd}")
         export_csv(diff_table,age,image_path,mode="ai_compare")
-        cv2.imshow("Fat Graft Predictor v4 – AI Compare",out_ai)
+        if not NO_GUI:
+            cv2.imshow("Fat Graft Predictor v4 – AI Compare",out_ai)
 
-    print("\n[INFO] Press any key in terminal or image window to close.")
-    while True:
-        if cv2.waitKey(1)!=-1: break
-        if HAS_MSVCRT and msvcrt.kbhit(): msvcrt.getch(); break
-    cv2.destroyAllWindows()
+    if not NO_GUI:
+        print("\n[INFO] Press any key in terminal or image window to close.")
+        while True:
+            if cv2.waitKey(1)!=-1: break
+            if HAS_MSVCRT and msvcrt.kbhit(): msvcrt.getch(); break
+        cv2.destroyAllWindows()
     print("[INFO] Done.")
 
 if __name__=="__main__":
