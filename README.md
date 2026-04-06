@@ -565,4 +565,5 @@ For issues, feature requests, or clinical validation feedback, contact the devel
 
 **Version:** 4.0 (April 2026)  
 **Status:** Professional Beta  
-**Maintainer:** Fat Graft Predictor Team
+**Maintainer:** Fat Graft Predictor Team  
+**Developer:** [Polok Poddar](https://iamproloy.vercel.app/)
